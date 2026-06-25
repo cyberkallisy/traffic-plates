@@ -70,33 +70,76 @@ OCR_MIN_HEIGHT = 18       # Awiros on crops below this height usually returns no
 
 
 # ---------------------------------------------------------------------------
-# Simple IoU-based plate tracker (no extra deps — no ByteTrack/DeepSORT)
+# ByteTracker wrapper (ultralytics BYTETracker, SimpleTracker-compatible API)
 # ---------------------------------------------------------------------------
-class SimpleTracker:
-    """Assigns persistent IDs to plates by greedy IoU association frame-to-frame.
+class ByteTracker:
+    """ByteTrack via ultralytics, exposing the SimpleTracker interface.
 
-    Why not use ultralytics trackers? Two reasons:
-      1. We don't need motion features — plates move rigidly with the car,
-         bbox IoU alone is a strong signal.
-      2. Keeps the pipeline Awiros-only (no deep_sort_realtime, no extra
-         config YAMLs).
+    Input:  update(detections) where detections = [(bbox_xyxy, yconf), ...]
+    Output: [(tid, bbox_xyxy, yconf), ...] with persistent track IDs across frames.
 
-    Rules:
-      - IoU >= 0.20 -> same track
-      - If a bbox in frame N doesn't match anything in frame N-1, start a new ID
-      - If a track disappears for >= max_age frames, retire it
+    Uses ultralytics' built-in BYTETracker (no extra deps beyond ultralytics).
+    ByteTrack is motion-only (Kalman + IoU), no ReID model needed — matches our
+    Awiros-only, lightweight pipeline.
     """
 
-    def __init__(self, iou_thresh: float = 0.20, max_age: int = 15):
-        self.iou_thresh = iou_thresh
+    class _ResultsView:
+        """Minimal Results-like object BYTETracker.update() expects.
+
+        BYTETracker accesses: .conf, .cls, .xyxy (parse_bboxes prefers .xywhr,
+        falls back to .xywh). We provide xywh + xyxy and hide xywhr via a
+        __getattr__ override that raises AttributeError (so the `hasattr` check
+        in parse_bboxes is False and it uses xywh instead).
+        """
+        def __init__(self, xyxy, conf, cls_):
+            xyxy = np.asarray(xyxy, dtype=float).reshape(-1, 4)
+            self.xyxy = xyxy
+            self.xywh = self._xyxy_to_xywh(xyxy)
+            self.conf = np.asarray(conf, dtype=float)
+            self.cls  = np.asarray(cls_, dtype=int)
+        def __getattr__(self, name):
+            raise AttributeError(
+                f"_ResultsView has no attribute '{name}'. "
+                "BYTETracker expects .xyxy, .xywh, .conf, .cls."
+            )
+        @staticmethod
+        def _xyxy_to_xywh(xyxy):
+            x1, y1, x2, y2 = xyxy[:, 0], xyxy[:, 1], xyxy[:, 2], xyxy[:, 3]
+            w, h = x2 - x1, y2 - y1
+            cx, cy = x1 + w / 2, y1 + h / 2
+            return np.stack([cx, cy, w, h], axis=1)
+        def __len__(self): return len(self.conf)
+        def __getitem__(self, key):
+            if isinstance(key, np.ndarray) and key.dtype == bool:
+                return ByteTracker._ResultsView(self.xyxy[key], self.conf[key], self.cls[key])
+            raise TypeError("BYTETracker._ResultsView only supports boolean-mask indexing")
+
+    def __init__(self, frame_rate: int = 30, max_age: int = 30,
+                 high_thresh: float = 0.5, low_thresh: float = 0.10,
+                 match_thresh: float = 0.8):
+        """Wrap ultralytics BYTETracker (motion-only, no ReID).
+
+        `frame_rate` is accepted for API symmetry with SimpleTracker and is used
+        by callers to size max_age; BYTETracker itself doesn't take a frame_rate.
+        """
+        import argparse
+        from ultralytics.trackers.byte_tracker import BYTETracker as _BYTETracker
+        args = argparse.Namespace()
+        args.tracker_yaml        = ''
+        args.track_high_thresh   = high_thresh
+        args.track_low_thresh    = low_thresh
+        args.new_track_thresh    = high_thresh + 0.1
+        args.track_buffer        = max_age
+        args.match_thresh        = match_thresh
+        args.fuse_score          = False
+        args.min_box_area        = 10
+        args.min_consecutive_frames = 1
+        self._bt = _BYTETracker(args=args)
         self.max_age = max_age
-        self._next_id = 0
-        self._active = {}  # id -> {"bbox": (x1,y1,x2,y2), "age": 0}
 
     @staticmethod
-    def _iou(a, b) -> float:
-        ax1, ay1, ax2, ay2 = a
-        bx1, by1, bx2, by2 = b
+    def _iou_xyxy(a, b) -> float:
+        ax1, ay1, ax2, ay2 = a; bx1, by1, bx2, by2 = b
         ix1, iy1 = max(ax1, bx1), max(ay1, by1)
         ix2, iy2 = min(ax2, bx2), min(ay2, by2)
         iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
@@ -107,43 +150,25 @@ class SimpleTracker:
         return inter / max(ua, 1)
 
     def update(self, detections: list) -> list:
-        """detections: list of (bbox, yconf).
-        Returns list of (tid, bbox, yconf) with assigned IDs.
-        """
-        # Age all active tracks
-        for tid in self._active:
-            self._active[tid]["age"] += 1
-        # Retire tracks older than max_age
-        retired = [tid for tid, st in self._active.items() if st["age"] > self.max_age]
-        for tid in retired:
-            del self._active[tid]
-
-        # Greedy IoU match: detections vs active tracks
-        assignments = []  # (det_idx, tid) or (det_idx, None)
-        used_tids = set()
-        for di, (bbox, yconf) in enumerate(detections):
-            best_iou, best_tid = 0.0, None
-            for tid, st in self._active.items():
-                if tid in used_tids:
-                    continue
-                iou = self._iou(bbox, st["bbox"])
-                if iou > best_iou:
-                    best_iou, best_tid = iou, tid
-            if best_tid is not None and best_iou >= self.iou_thresh:
-                used_tids.add(best_tid)
-                assignments.append((di, best_tid, bbox, yconf))
-            else:
-                # New track
-                new_id = self._next_id
-                self._next_id += 1
-                self._active[new_id] = {"bbox": bbox, "age": 0}
-                assignments.append((di, new_id, bbox, yconf))
-
-        # Refresh matched tracks
+        """detections: list of (bbox, yconf). Returns list of (tid, bbox, yconf)."""
+        if not detections:
+            return []
+        xyxy = np.array([[*d[0]] for d in detections], dtype=float)
+        conf = np.array([d[1] for d in detections], dtype=float)
+        cls  = np.zeros(len(detections), dtype=int)  # single class: plate
+        results = self._ResultsView(xyxy, conf, cls)
+        tracks = self._bt.update(results)  # np.ndarray, rows = [x1,y1,x2,y2,tid,conf,cls,idx]
         out = []
-        for di, tid, bbox, yconf in assignments:
-            self._active[tid] = {"bbox": bbox, "age": 0}
-            out.append((tid, bbox, yconf))
+        for t in tracks:
+            tx1, ty1, tx2, ty2, tid = float(t[0]), float(t[1]), float(t[2]), float(t[3]), int(t[4])
+            # Match track bbox back to the best input detection to keep the
+            # original YOLO confidence (BYTETracker's conf column is fused).
+            best_iou, best_idx = 0.0, 0
+            for i, (bbox, _) in enumerate(detections):
+                iou = self._iou_xyxy((tx1, ty1, tx2, ty2), bbox)
+                if iou > best_iou:
+                    best_iou, best_idx = iou, i
+            out.append((tid, tuple(detections[best_idx][0]), detections[best_idx][1]))
         return out
 
 
@@ -257,7 +282,7 @@ def process_video(
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         out_video = cv2.VideoWriter(str(out_video_path), fourcc, fps, (W, H))
 
-    tracker = SimpleTracker(iou_thresh=iou_thresh, max_age=max(15, fps * 2))
+    tracker = ByteTracker(frame_rate=int(fps), max_age=max(30, fps * 2))
 
     history = defaultdict(lambda: {
         "reads": [],       # list[(text, conf)]
@@ -492,7 +517,8 @@ def process_video(
         "n_frames_processed": n_proc,
         "fps": round(fps, 2),
         "stride": stride,
-        "tracker": "SimpleTracker (IoU-based, max_age={}f)".format(tracker.max_age),
+        "tracker": "ByteTracker (ultralytics, max_age={}f, frame_rate={}fps)".format(
+            tracker.max_age, int(fps)),
         "elapsed_sec": elapsed,
         "fps_processed": round(n_proc / elapsed, 2) if elapsed > 0 else 0.0,
         "n_tracks": len(tracks_summary),

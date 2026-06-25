@@ -1,13 +1,13 @@
 # traffic-plates
 
-ANPR (Automatic Number Plate Recognition) web app. Upload a video or image, get back detected plates with bounding boxes and OCR text.
+Minimal ANPR (Automatic Number Plate Recognition) web app. Upload an image or video, get back detected plates with bounding boxes, track IDs, and OCR text.
 
 ## Pipeline
 
-- **Detection**: YOLO11 (`yolo11_plate.pt`) — fine-tuned on Indian number plates
-- **Tracking (video)**: DeepSORT
-- **OCR**: Awiros ANPR
-- **Web**: Flask (port 8766)
+- **Detection**: YOLO11 (`yolo11_plate.pt`) — fine-tuned on Indian number plates (single class: `License_Plate`)
+- **Tracking**: ByteTrack (ultralytics built-in, motion-only — no ReID model)
+- **OCR**: Awiros ANPR (PP-OCRv5 SVTR_HGNet / CTC)
+- **Web**: Flask on port 8766
 
 ## Run
 
@@ -15,34 +15,36 @@ ANPR (Automatic Number Plate Recognition) web app. Upload a video or image, get 
 # Install deps (Python 3.11, CUDA optional)
 pip install -r requirements.txt
 
-# Drop model weights into the repo root before first run:
-#   yolo11_plate.pt             (YOLO11 plate detector)
-#   awiros_anpr/model.safetensors (Awiros ANPR)
+# Drop the two model artifacts into the repo root before first run:
+#   yolo11_plate.pt              (YOLO11 plate detector)
+#   awiros_anpr/model.safetensors (Awiros ANPR OCR)
 
-python run.py            # default http://127.0.0.1:8766
+python run.py             # default http://127.0.0.1:8766
 python run.py --port 9000
-python run.py --no-warmup   # skip model load at startup
+python run.py --no-warmup # skip model load at startup
 ```
 
 ## Layout
 
 ```
-run.py                       # entry point
+run.py                       # entry point — Flask app + warmup
 api/
   __init__.py                # Flask app factory (create_app)
-  routes_video.py            # /api/video, /api/video_status, /api/video_results
-  routes_image.py            # /api/image
+  routes_video.py            # /api/detect_video, /api/track_details, /video-results/*
+  routes_image.py            # /api/detect, /api/predict
 core/
-  engine.py                  # ANPR engine (YOLO + OCR + tracker)
+  engine.py                  # ANPR engine (YOLO + Awiros OCR)
+anpr_video_awiros.py         # video pipeline + ByteTracker wrapper
+detect_yolo11_awiros_ocr.py  # YOLO11 loader + AwirosANPR class + draw helper
 templates/index.html         # upload UI
 static/                      # JS + CSS
 requirements.txt
 ```
 
-Model weights, sample images, and runtime artifacts (uploads, results, logs) are listed in `.gitignore` and are not tracked in git.
+The model weights (`yolo11_plate.pt`, `awiros_anpr/`), runtime uploads, and per-video result folders are listed in `.gitignore` and are not tracked in git.
 
 ## Notes
 
-- Server logs to `_server.log` (also visible in the embedded terminal during dev).
-- `app_backup.py` is the pre-restructured single-file Flask app, kept for reference.
-- The `anpr_video_awiros.py` and `detect_yolo11_awiros_ocr.py` scripts are the standalone CLI equivalents of the engine — useful for batch processing outside the web UI.
+- `run.py` listens on `127.0.0.1:8766` by default. Use `--port` to change it.
+- The video pipeline uses **ByteTrack** via ultralytics' built-in tracker (motion-only Kalman + IoU association). It exposes the same `(bbox, yconf) -> (tid, bbox, yconf)` interface the rest of the pipeline already speaks, so swapping to BoT-SORT / DeepOC-SORT is a one-line change inside `anpr_video_awiros.ByteTracker`.
+- Per-character-position voting across frames collapses OCR noise into a final plate text + confidence per track.
