@@ -1,0 +1,8 @@
+flask>=3.0
+ultralytics>=8.0
+opencv-python>=4.8
+numpy>=1.24,<2.4
+Pillow
+paddlepaddle>=2.6,<3.0
+paddleocr>=2.7,<3.0
+pytesseract>=0.3.10

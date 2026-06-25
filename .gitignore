@@ -1,0 +1,90 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtualenvs
+venv/
+.venv/
+env/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs and runtime artifacts
+*.log
+*.out
+_server.log
+server.log
+_server.out
+
+# Local debug / scratch
+_bench.py
+_last_detect.json
+_last_video_data.json
+_test_10s_quick.json
+fresh_test.json
+last_result.json
+detect_response.json
+detect_response2.json
+urls.txt
+walkthrough.html
+
+# OCR / PaddleOCR model dirs (large, regeneratable)
+ch_PP-OCRv3_cls_server/
+ch_PP-OCRv4_det_server_infer/
+ch_PP-OCRv4_rec_server_infer/
+
+# Awiros ANPR model (large safetensors)
+awiros_anpr/
+
+# Trained model weights (large, regeneratable)
+*.pt
+*.pth
+*.onnx
+*.safetensors
+
+# Local datasets and runs
+plate_dataset/
+crops/
+runs/
+models_hf/
+qwen 2.5 vl/
+qwen3 vl 235b a22b/
+
+# Generated / temp results
+results/
+results.pdf
+results_yolo11/
+results_yolo12_annotated/
+results_yolo12_crops/
+results_yolo12_summary.json
+comparison_results/
+comparison.json
+comparison_plates.json
+fastalpr_results_*/
+trocr_results_*/
+paddle_vs_minimax3_*/
+name_plate_ocr_results/
+INPUT IMAGE/
+
+# Uploads (user-provided, do not commit)
+uploads/
+uploads_videos/
+video_results/
+
+# Env / secrets
+.env
+*.env.local
